@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python3
 """
 ML_Pipeline.py
@@ -6,19 +5,24 @@ ML_Pipeline.py
 This script:
   1. Loads gym_data.csv containing gym occupancy data.
   2. Filters to machine rows and trains a Random Forest classifier to predict occupancy.
-  3. Evaluates all orderings for a given workout plan by simulating a schedule.
-     For each machine in the plan, it finds the earliest free time (after arrival).
-  4. Outputs the best ordering (schedule) with minimal total wait time.
-  5. Prints progress info during evaluation.
-     
+  3. Prompts the user for a muscle group ("push", "pull", or "legs") and a total workout duration (in minutes).
+  4. Selects the machines corresponding to the chosen group.
+  5. Simulates schedules using a fixed per‑machine usage time (7 minutes) and a fixed travel time.
+     It evaluates orderings of the selected machine group using branch and bound search,
+     while ensuring no duplicate base machines are used in a workout.
+  6. Outputs the best ordering (schedule) with minimal total wait time if at least two machines can be fit;
+     otherwise, it reports that the gym cannot accommodate a workout within that duration.
+  7. Prints progress info during evaluation.
+
 Usage:
   python ML_Pipeline.py
 """
-import pandas as pd
+
 import numpy as np
+import pandas as pd
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.preprocessing import OneHotEncoder
-import itertools
+
 
 def load_data(csv_file):
     df = pd.read_csv(csv_file)
@@ -38,7 +42,7 @@ def train_model(csv_file):
     df = df[df['role'] == "machine"]
     df = df.dropna(subset=['paired'])
     df['paired'] = df['paired'].astype(int)
-    
+
     X, y, encoder = preprocess_data(df)
     model = RandomForestClassifier(n_estimators=100, random_state=42)
     model.fit(X, y)
@@ -65,7 +69,7 @@ def next_free_time(model, encoder, machine_info, arrival_time, resolution=1, max
         t += resolution
     return None
 
-def simulate_schedule(model, encoder, df, ordering, start_time, travel_time, usage_time, resolution=1):
+def simulate_schedule(model, encoder, df, ordering, start_time, travel_time, usage_time, total_duration, resolution=1):
     schedule = []
     current_time = start_time
     total_wait = 0
@@ -82,6 +86,9 @@ def simulate_schedule(model, encoder, df, ordering, start_time, travel_time, usa
             print(f"[WARN] Could not find free time for machine {machine} starting at {arrival_time}.")
             return None, None
         wait_time = free_time - arrival_time
+        # If the free time plus usage would exceed the total workout duration, break out.
+        if free_time + usage_time > total_duration:
+            break
         total_wait += wait_time
         usage_start = free_time
         usage_finish = usage_start + usage_time
@@ -94,53 +101,145 @@ def simulate_schedule(model, encoder, df, ordering, start_time, travel_time, usa
             "usage_finish": usage_finish
         })
         current_time = usage_finish + travel_time
+        if current_time > total_duration:
+            break
+    # We require that at least 2 machines are scheduled.
+    if len(schedule) < 2:
+        return None, None
     return schedule, total_wait
 
-def find_best_plan(model, encoder, df, workout_plan, start_time, travel_time, usage_time, resolution=1):
+def get_base_name(machine):
+    """
+    Returns the base name of a machine by stripping a trailing digit if it exists.
+    For example, "Cable Pull Down 1" -> "Cable Pull Down"
+    """
+    tokens = machine.split()
+    if tokens[-1].isdigit():
+        return " ".join(tokens[:-1])
+    return machine
+
+def find_best_plan_branch_and_bound(model, encoder, df, machines, start_time, travel_time, usage_time, total_duration, resolution=1):
     best_total_wait = float('inf')
     best_schedule = None
     best_ordering = None
 
-    permutations = list(itertools.permutations(workout_plan))
-    total_permutations = len(permutations)
-    print(f"[INFO] Evaluating {total_permutations} orderings...")
-    
-    for i, ordering in enumerate(permutations, start=1):
-        schedule, total_wait = simulate_schedule(model, encoder, df, list(ordering),
-                                                 start_time, travel_time, usage_time, resolution)
-        print(f"[DEBUG] Order {i}/{total_permutations}: {ordering}, Total Wait = {total_wait if total_wait is not None else 'N/A'} sec")
-        if schedule is None:
-            continue
-        if total_wait < best_total_wait:
-            best_total_wait = total_wait
-            best_schedule = schedule
-            best_ordering = ordering
+    def recursive_search(current_ordering, remaining_machines, current_time, accumulated_wait):
+        nonlocal best_total_wait, best_schedule, best_ordering
 
+        # If current ordering has at least two machines, simulate the schedule.
+        if len(current_ordering) >= 2:
+            schedule, total_wait = simulate_schedule(model, encoder, df, current_ordering, start_time, travel_time, usage_time, total_duration, resolution)
+            if schedule is not None and total_wait < best_total_wait:
+                best_total_wait = total_wait
+                best_schedule = schedule
+                best_ordering = tuple(current_ordering)
+
+        if not remaining_machines:
+            return
+
+        # Compute base names already used in the current ordering.
+        used_bases = {get_base_name(m) for m in current_ordering}
+        for machine in remaining_machines:
+            # Skip machines that are of the same base type already selected.
+            if get_base_name(machine) in used_bases:
+                continue
+
+            machine_rows = df[df['object'] == machine]
+            if machine_rows.empty:
+                continue
+            row = machine_rows.iloc[0]
+            machine_info = {"x": row["x"], "y": row["y"], "z": row["z"], "object": machine}
+
+            arrival_time = current_time
+            free_time = next_free_time(model, encoder, machine_info, arrival_time, resolution)
+            if free_time is None:
+                continue
+            if free_time + usage_time > total_duration:
+                continue
+            wait_time = free_time - arrival_time
+            new_accumulated_wait = accumulated_wait + wait_time
+
+            # Prune branch if accumulated wait is already worse than best found.
+            if new_accumulated_wait >= best_total_wait:
+                continue
+
+            new_current_time = free_time + usage_time + travel_time
+            new_ordering = current_ordering + [machine]
+            new_remaining = [m for m in remaining_machines if m != machine]
+            recursive_search(new_ordering, new_remaining, new_current_time, new_accumulated_wait)
+
+    recursive_search([], machines, start_time, 0)
     return best_ordering, best_schedule, best_total_wait
 
 def main():
+    # Prompt user for muscle group and total workout duration.
+    group_input = input("Enter muscle group (push, pull, legs): ").strip().lower()
+    duration_input = input("Enter total workout duration (in minutes, e.g., 30, 45, 60): ").strip()
+    try:
+        total_duration_min = int(duration_input)
+    except ValueError:
+        print("Invalid duration input. Defaulting to 30 minutes.")
+        total_duration_min = 30
+    total_duration = total_duration_min * 60  # total workout duration in seconds
+
+    # Fixed per-machine usage time and travel time.
+    usage_time_per_machine = 420  # 7 minutes in seconds (modified from 600 sec)
+    travel_time = 60              # 60 seconds
+    resolution = 1
+
+    # Define machine groups.
+    push_machines = [
+        "Machine Incline Bench 1",
+        "Incline Bench 1",
+        "Incline Bench 2",
+        "Chest Press Machine 1"
+    ]
+    pull_machines = [
+        "Cable Pull Down 1",
+        "Cable Pull Down 2",
+        "Cable Pull Down 3",
+        "Back Row Machine 1",
+        "Back Row Machine 2",
+        "Back Row Machine 3",
+        "Bicep Curls Machine 1"
+    ]
+    leg_machines = [
+        "Leg Press 1",
+        "Squat Rack 1",
+        "Leg Extension 1",
+        "Leg Curl 1",
+        "Calf Raise 1"
+    ]
+
+    if group_input == "push":
+        user_workout_plan = push_machines
+    elif group_input == "pull":
+        user_workout_plan = pull_machines
+    elif group_input == "legs":
+        user_workout_plan = leg_machines
+    else:
+        print("Invalid group input. Defaulting to 'push'.")
+        user_workout_plan = push_machines
+
+    print(f"[INFO] Evaluating all orderings for muscle group '{group_input}' with machines: {user_workout_plan}")
+    print(f"[INFO] Total workout duration: {total_duration_min} minutes.")
+    print(f"[INFO] Each machine usage is fixed at {usage_time_per_machine/60:.1f} minutes, with {travel_time} sec travel time between machines.\n")
+
     csv_file = "gym_data.csv"
     model, encoder, df = train_model(csv_file)
-    
-    # TODO: need to take in Incline Bench & find the best machine to go to
+    start_time = 0
 
-    # For demonstration, let's pick one machine from each group as a plan:
-    user_workout_plan = ["Incline Bench 1", "Cable Pull Down 1", "Leg Press 1"]
-    
-    start_time = 0            # Start at 0 sec
-    travel_time = 60          # 60 sec travel
-    usage_time = 10 * 60      # 600 sec usage
-    resolution = 1            # 1 sec resolution
-
-    print(f"[INFO] Evaluating all orderings for workout plan: {user_workout_plan}\n")
-    best_ordering, best_schedule, best_total_wait = find_best_plan(model, encoder, df,
-                                                                   user_workout_plan,
-                                                                   start_time,
-                                                                   travel_time,
-                                                                   usage_time,
-                                                                   resolution)
+    best_ordering, best_schedule, best_total_wait = find_best_plan_branch_and_bound(
+        model, encoder, df,
+        user_workout_plan,
+        start_time,
+        travel_time,
+        usage_time_per_machine,
+        total_duration,
+        resolution
+    )
     if best_schedule is None:
-        print("[ERROR] Could not determine a valid schedule.")
+        print("[ERROR] Could not determine a valid schedule. The gym cannot accommodate a workout with at least 2 machines within the given duration.")
         return
 
     print(f"\nBest Ordering: {best_ordering}")
