@@ -3,3 +3,4 @@ fastml
 *.venv
 get-pip.py
 .DS_Store
+venv

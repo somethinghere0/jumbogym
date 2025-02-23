@@ -26,6 +26,7 @@ class ScheduleResponse(BaseModel):
     best_ordering: List[str]
     schedule: List[dict]
     total_wait: float
+    total_duration: float  # Total duration of the workout in seconds
 
 class MuscleGroup(str, Enum):
     PUSH = "push"
@@ -53,10 +54,12 @@ def create_workout(request: WorkoutRequest):
         )
 
     # Format the response according to ScheduleResponse model
+    total_duration = max(machine["usage_finish"] for machine in best_schedule)
     response = ScheduleResponse(
         best_ordering=list(best_ordering),
         schedule=best_schedule,
-        total_wait=best_total_wait
+        total_wait=best_total_wait,
+        total_duration=total_duration
     )
 
     return response
