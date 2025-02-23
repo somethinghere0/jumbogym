@@ -171,6 +171,66 @@ def find_best_plan_branch_and_bound(model, encoder, df, machines, start_time, tr
     recursive_search([], machines, start_time, 0)
     return best_ordering, best_schedule, best_total_wait
 
+def find_best_plan_simple(muscle_group, duration_min):
+
+    total_duration = duration_min * 60  # convert minutes to seconds
+    usage_time_per_machine = 420       # 7 minutes in seconds
+    travel_time = 60                   # 60 seconds travel time between machines
+    resolution = 1
+
+    # Define machine groups.
+    push_machines = [
+        "Machine Incline Bench 1",
+        "Incline Bench 1",
+        "Incline Bench 2",
+        "Chest Press Machine 1"
+    ]
+    pull_machines = [
+        "Cable Pull Down 1",
+        "Cable Pull Down 2",
+        "Cable Pull Down 3",
+        "Back Row Machine 1",
+        "Back Row Machine 2",
+        "Back Row Machine 3",
+        "Bicep Curls Machine 1"
+    ]
+    leg_machines = [
+        "Leg Press 1",
+        "Squat Rack 1",
+        "Leg Extension 1",
+        "Leg Curl 1",
+        "Calf Raise 1"
+    ]
+
+    if muscle_group.lower() == "push":
+        user_workout_plan = push_machines
+    elif muscle_group.lower() == "pull":
+        user_workout_plan = pull_machines
+    elif muscle_group.lower() == "legs":
+        user_workout_plan = leg_machines
+    else:
+        print("Invalid muscle group input. Defaulting to 'push'.")
+        user_workout_plan = push_machines
+
+    csv_file = "gym_data.csv"
+    model, encoder, df = train_model(csv_file)
+    start_time = 0
+
+    best_ordering, best_schedule, best_total_wait = find_best_plan_branch_and_bound(
+        model, encoder, df,
+        user_workout_plan,
+        start_time,
+        travel_time,
+        usage_time_per_machine,
+        total_duration,
+        resolution
+    )
+
+    if best_schedule is None:
+        print("[ERROR] Could not determine a valid schedule. The gym cannot accommodate a workout with at least 2 machines within the given duration.")
+
+    return best_ordering, best_schedule, best_total_wait
+
 def main():
     # Prompt user for muscle group and total workout duration.
     group_input = input("Enter muscle group (push, pull, legs): ").strip().lower()

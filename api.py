@@ -1,7 +1,11 @@
+from enum import Enum
+from typing import List, Literal, Optional
+
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from typing import List, Optional
-from ML_Pipeline import train_model, find_best_plan  # Corrected import statement
+
+from ML_Pipeline import find_best_plan_simple  # Corrected import statement
+from ML_Pipeline import train_model
 
 app = FastAPI()
 
@@ -23,23 +27,39 @@ class ScheduleResponse(BaseModel):
     schedule: List[dict]
     total_wait: float
 
-@app.post("/schedule", response_model=ScheduleResponse)
-def get_schedule(request: ScheduleRequest):
-    best_ordering, best_schedule, best_total_wait = find_best_plan(
-        model, encoder, df,
-        workout_plan=request.workout_plan,
-        start_time=request.start_time,
-        travel_time=request.travel_time,
-        usage_time=request.usage_time,
-        resolution=request.resolution
+class MuscleGroup(str, Enum):
+    PUSH = "push"
+    PULL = "pull"
+    LEGS = "legs"
+
+class WorkoutRequest(BaseModel):
+    muscle_group: MuscleGroup
+    workout_duration: Literal[30, 45, 60]
+
+
+@app.post("/createWorkout")
+def create_workout(request: WorkoutRequest):
+    # Call the ML pipeline to get the best workout plan
+    best_ordering, best_schedule, best_total_wait = find_best_plan_simple(
+        request.muscle_group.value,
+        request.workout_duration
     )
+
+    # Handle case where no valid schedule was found
     if best_schedule is None:
-        raise HTTPException(status_code=400, detail="No valid schedule found.")
-    return {
-        "best_ordering": list(best_ordering),
-        "schedule": best_schedule,
-        "total_wait": best_total_wait
-    }
+        raise HTTPException(
+            status_code=400,
+            detail="Could not determine a valid schedule. The gym cannot accommodate a workout with at least 2 machines within the given duration."
+        )
+
+    # Format the response according to ScheduleResponse model
+    response = ScheduleResponse(
+        best_ordering=list(best_ordering),
+        schedule=best_schedule,
+        total_wait=best_total_wait
+    )
+
+    return response
 
 @app.get("/health")
 def health_check():
