@@ -4,25 +4,35 @@ ML_Pipeline.py
 
 This script:
   1. Loads gym_data.csv containing gym occupancy data.
-  2. Filters to machine rows and trains a Random Forest classifier to predict occupancy.
+  2. Filters to machine rows and trains a Random Forest classifier to predict occupancy,
+     but only if the CSV file has been updated.
   3. Prompts the user for a muscle group ("push", "pull", or "legs") and a total workout duration (in minutes).
-  4. Selects the machines corresponding to the chosen group.
+  4. Selects the machines corresponding to the chosen group (ensuring no duplicate base machines).
   5. Simulates schedules using a fixed per‑machine usage time (7 minutes) and a fixed travel time.
-     It evaluates orderings of the selected machine group using branch and bound search,
-     while ensuring no duplicate base machines are used in a workout.
+     It evaluates orderings of the selected machine group using branch and bound search.
   6. Outputs the best ordering (schedule) with minimal total wait time if at least two machines can be fit;
      otherwise, it reports that the gym cannot accommodate a workout within that duration.
-  7. Prints progress info during evaluation.
+  7. Prints the order to do the workout along with the time you arrive, when the machine is free,
+     wait time, usage start, and usage finish.
 
 Usage:
   python ML_Pipeline.py
 """
+
+import concurrent.futures
+import os
+import threading
 
 import numpy as np
 import pandas as pd
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.preprocessing import OneHotEncoder
 
+# Global cache for model and CSV timestamp.
+cached_model = None
+cached_encoder = None
+cached_df = None
+cached_csv_mtime = None
 
 def load_data(csv_file):
     df = pd.read_csv(csv_file)
@@ -37,6 +47,17 @@ def preprocess_data(df):
     return X, y, encoder
 
 def train_model(csv_file):
+    """
+    Train the model only if the CSV has been updated.
+    Uses caching to avoid retraining if the file is unchanged.
+    """
+    global cached_model, cached_encoder, cached_df, cached_csv_mtime
+
+    mtime = os.path.getmtime(csv_file)
+    if cached_model is not None and cached_csv_mtime == mtime:
+        print(f"[INFO] Using cached model trained on {len(cached_df)} samples.")
+        return cached_model, cached_encoder, cached_df
+
     df = load_data(csv_file)
     # Filter to machine rows only
     df = df[df['role'] == "machine"]
@@ -47,6 +68,13 @@ def train_model(csv_file):
     model = RandomForestClassifier(n_estimators=100, random_state=42)
     model.fit(X, y)
     print(f"[INFO] Model trained on {len(df)} samples.")
+
+    # Update the cache.
+    cached_model = model
+    cached_encoder = encoder
+    cached_df = df
+    cached_csv_mtime = mtime
+
     return model, encoder, df
 
 def build_feature_vector(machine_info, t, encoder):
@@ -103,7 +131,7 @@ def simulate_schedule(model, encoder, df, ordering, start_time, travel_time, usa
         current_time = usage_finish + travel_time
         if current_time > total_duration:
             break
-    # We require that at least 2 machines are scheduled.
+    # Require at least 2 machines in the schedule.
     if len(schedule) < 2:
         return None, None
     return schedule, total_wait
@@ -118,10 +146,25 @@ def get_base_name(machine):
         return " ".join(tokens[:-1])
     return machine
 
+def unique_machines(machine_list):
+    """
+    Filters the provided list so that only one machine per base name is kept.
+    """
+    seen = set()
+    unique = []
+    for m in machine_list:
+        base = get_base_name(m)
+        if base not in seen:
+            unique.append(m)
+            seen.add(base)
+    return unique
+
 def find_best_plan_branch_and_bound(model, encoder, df, machines, start_time, travel_time, usage_time, total_duration, resolution=1):
+    # Shared best solution variables and a lock for thread safety.
     best_total_wait = float('inf')
     best_schedule = None
     best_ordering = None
+    lock = threading.Lock()
 
     def recursive_search(current_ordering, remaining_machines, current_time, accumulated_wait):
         nonlocal best_total_wait, best_schedule, best_ordering
@@ -129,10 +172,12 @@ def find_best_plan_branch_and_bound(model, encoder, df, machines, start_time, tr
         # If current ordering has at least two machines, simulate the schedule.
         if len(current_ordering) >= 2:
             schedule, total_wait = simulate_schedule(model, encoder, df, current_ordering, start_time, travel_time, usage_time, total_duration, resolution)
-            if schedule is not None and total_wait < best_total_wait:
-                best_total_wait = total_wait
-                best_schedule = schedule
-                best_ordering = tuple(current_ordering)
+            if schedule is not None:
+                with lock:
+                    if total_wait < best_total_wait:
+                        best_total_wait = total_wait
+                        best_schedule = schedule
+                        best_ordering = tuple(current_ordering)
 
         if not remaining_machines:
             return
@@ -140,7 +185,7 @@ def find_best_plan_branch_and_bound(model, encoder, df, machines, start_time, tr
         # Compute base names already used in the current ordering.
         used_bases = {get_base_name(m) for m in current_ordering}
         for machine in remaining_machines:
-            # Skip machines that are of the same base type already selected.
+            # Skip machines whose base name is already selected.
             if get_base_name(machine) in used_bases:
                 continue
 
@@ -159,20 +204,37 @@ def find_best_plan_branch_and_bound(model, encoder, df, machines, start_time, tr
             wait_time = free_time - arrival_time
             new_accumulated_wait = accumulated_wait + wait_time
 
-            # Prune branch if accumulated wait is already worse than best found.
-            if new_accumulated_wait >= best_total_wait:
-                continue
+            with lock:
+                if new_accumulated_wait >= best_total_wait:
+                    continue
 
             new_current_time = free_time + usage_time + travel_time
             new_ordering = current_ordering + [machine]
             new_remaining = [m for m in remaining_machines if m != machine]
             recursive_search(new_ordering, new_remaining, new_current_time, new_accumulated_wait)
 
-    recursive_search([], machines, start_time, 0)
+    # Launch the first level of recursion concurrently.
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+        futures = []
+        for machine in machines:
+            initial_ordering = [machine]
+            remaining = [m for m in machines if m != machine]
+            futures.append(executor.submit(recursive_search, initial_ordering, remaining, start_time, 0))
+        concurrent.futures.wait(futures)
+
     return best_ordering, best_schedule, best_total_wait
 
 def find_best_plan_simple(muscle_group, duration_min):
+    """
+    A simplified interface to get the best gym workout plan.
 
+    Parameters:
+      muscle_group (str): "push", "pull", or "legs"
+      duration_min (int): Total workout duration in minutes
+
+    Returns:
+      tuple: (best_ordering, best_schedule, best_total_wait)
+    """
     total_duration = duration_min * 60  # convert minutes to seconds
     usage_time_per_machine = 420       # 7 minutes in seconds
     travel_time = 60                   # 60 seconds travel time between machines
@@ -202,15 +264,16 @@ def find_best_plan_simple(muscle_group, duration_min):
         "Calf Raise 1"
     ]
 
+    # Choose the list and filter to unique machines based on base name.
     if muscle_group.lower() == "push":
-        user_workout_plan = push_machines
+        user_workout_plan = unique_machines(push_machines)
     elif muscle_group.lower() == "pull":
-        user_workout_plan = pull_machines
+        user_workout_plan = unique_machines(pull_machines)
     elif muscle_group.lower() == "legs":
-        user_workout_plan = leg_machines
+        user_workout_plan = unique_machines(leg_machines)
     else:
         print("Invalid muscle group input. Defaulting to 'push'.")
-        user_workout_plan = push_machines
+        user_workout_plan = unique_machines(push_machines)
 
     csv_file = "gym_data.csv"
     model, encoder, df = train_model(csv_file)
@@ -240,21 +303,21 @@ def main():
     except ValueError:
         print("Invalid duration input. Defaulting to 30 minutes.")
         total_duration_min = 30
-    total_duration = total_duration_min * 60  # total workout duration in seconds
 
-    # Fixed per-machine usage time and travel time.
-    usage_time_per_machine = 420  # 7 minutes in seconds (modified from 600 sec)
-    travel_time = 60              # 60 seconds
-    resolution = 1
+    print(f"[INFO] Evaluating all orderings for muscle group '{group_input}'")
+    print(f"[INFO] Total workout duration: {total_duration_min} minutes.\n")
 
-    # Define machine groups.
-    push_machines = [
+    csv_file = "gym_data.csv"
+    model, encoder, df = train_model(csv_file)
+
+    # Define machine groups (same as in find_best_plan_simple) and filter for unique machines.
+    push_machines = unique_machines([
         "Machine Incline Bench 1",
         "Incline Bench 1",
         "Incline Bench 2",
         "Chest Press Machine 1"
-    ]
-    pull_machines = [
+    ])
+    pull_machines = unique_machines([
         "Cable Pull Down 1",
         "Cable Pull Down 2",
         "Cable Pull Down 3",
@@ -262,14 +325,14 @@ def main():
         "Back Row Machine 2",
         "Back Row Machine 3",
         "Bicep Curls Machine 1"
-    ]
-    leg_machines = [
+    ])
+    leg_machines = unique_machines([
         "Leg Press 1",
         "Squat Rack 1",
         "Leg Extension 1",
         "Leg Curl 1",
         "Calf Raise 1"
-    ]
+    ])
 
     if group_input == "push":
         user_workout_plan = push_machines
@@ -281,14 +344,15 @@ def main():
         print("Invalid group input. Defaulting to 'push'.")
         user_workout_plan = push_machines
 
-    print(f"[INFO] Evaluating all orderings for muscle group '{group_input}' with machines: {user_workout_plan}")
-    print(f"[INFO] Total workout duration: {total_duration_min} minutes.")
+    usage_time_per_machine = 420  # 7 minutes in seconds
+    travel_time = 60              # 60 seconds
+    total_duration = total_duration_min * 60  # convert minutes to seconds
+    resolution = 1
+
+    print(f"[INFO] Machines: {user_workout_plan}")
     print(f"[INFO] Each machine usage is fixed at {usage_time_per_machine/60:.1f} minutes, with {travel_time} sec travel time between machines.\n")
 
-    csv_file = "gym_data.csv"
-    model, encoder, df = train_model(csv_file)
     start_time = 0
-
     best_ordering, best_schedule, best_total_wait = find_best_plan_branch_and_bound(
         model, encoder, df,
         user_workout_plan,
@@ -302,8 +366,8 @@ def main():
         print("[ERROR] Could not determine a valid schedule. The gym cannot accommodate a workout with at least 2 machines within the given duration.")
         return
 
-    print(f"\nBest Ordering: {best_ordering}")
-    print("Workout Plan Schedule:")
+    # Print the detailed workout plan.
+    print("\nWorkout Plan Schedule:")
     for item in best_schedule:
         print(f"Machine: {item['machine']}")
         print(f"  Arrival Time: {item['arrival_time']:.1f} sec")
@@ -311,7 +375,9 @@ def main():
         print(f"  Wait Time: {item['wait_time']:.1f} sec")
         print(f"  Usage Start: {item['usage_start']:.1f} sec")
         print(f"  Usage Finish: {item['usage_finish']:.1f} sec")
-    print(f"\nTotal Wait Time: {best_total_wait:.1f} sec")
+    overall_end = best_schedule[-1]['usage_finish']
+    print(f"\nWorkout End Time: {overall_end:.1f} sec")
+    print(f"Total Wait Time: {best_total_wait:.1f} sec")
 
 if __name__ == "__main__":
     main()
