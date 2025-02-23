@@ -3,4 +3,5 @@ uvicorn
 pydantic
 pandas
 scikit-learn
-fastapi[standard]
+fastapi
+fastapi-cors

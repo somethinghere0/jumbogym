@@ -1,0 +1,8 @@
+# flyctl launch added from .gitignore
+**/__pycache__
+**/fastml
+**/*.venv
+**/get-pip.py
+**/.DS_Store
+**/venv
+fly.toml
