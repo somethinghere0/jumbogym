@@ -241,11 +241,11 @@ def find_best_plan_simple(muscle_group: str, duration_min: int):
     Returns:
       tuple: (best_ordering, best_schedule, best_total_wait)
     """
-    # # Check cache first
-    # cache_key = (muscle_group.lower(), duration_min)
-    # if cache_key in workout_cache:
-    #     print(f"[INFO] Using cached workout plan for {muscle_group} with {duration_min} minutes duration")
-    #     return workout_cache[cache_key]
+    # Check cache first
+    cache_key = (muscle_group.lower(), duration_min)
+    if cache_key in workout_cache:
+        print(f"[INFO] Using cached workout plan for {muscle_group} with {duration_min} minutes duration")
+        return workout_cache[cache_key]
 
     total_duration = duration_min * 60  # convert minutes to seconds
     usage_time_per_machine = 420       # 7 minutes in seconds
@@ -304,9 +304,8 @@ def find_best_plan_simple(muscle_group: str, duration_min: int):
     if best_schedule is None:
         print("[ERROR] Could not determine a valid schedule. The gym cannot accommodate a workout with at least 2 machines within the given duration.")
     else:
-        pass
         # Cache the result
-        # workout_cache[cache_key] = (best_ordering, best_schedule, best_total_wait)
+        workout_cache[cache_key] = (best_ordering, best_schedule, best_total_wait)
 
     return best_ordering, best_schedule, best_total_wait
 
