@@ -122,6 +122,8 @@ def main():
     csv_file = "gym_data.csv"
     model, encoder, df = train_model(csv_file)
     
+    # TODO: need to take in Incline Bench & find the best machine to go to
+
     # For demonstration, let's pick one machine from each group as a plan:
     user_workout_plan = ["Incline Bench 1", "Cable Pull Down 1", "Leg Press 1"]
     
